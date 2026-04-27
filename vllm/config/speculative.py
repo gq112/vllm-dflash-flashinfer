@@ -950,7 +950,6 @@ class SpeculativeConfig:
                 f"than zero ({self.num_speculative_tokens})."
             )
 
-<<<<<<< Updated upstream
         if self.rejection_sample_method == "synthetic":
             # Consolidate to per-position rates
             self.synthetic_acceptance_rates = self._resolve_synthetic_acceptance_rates(
@@ -965,8 +964,7 @@ class SpeculativeConfig:
         ):
             raise ValueError(
                 "synthetic_acceptance_rates / synthetic_acceptance_length "
-                "are only valid with rejection_sample_method='synthetic'."
-=======
+                "are only valid with rejection_sample_method='synthetic'.")
         if self.num_target_verify_tokens is None:
             self.num_target_verify_tokens = self.num_speculative_tokens
 
@@ -991,7 +989,6 @@ class SpeculativeConfig:
             raise ValueError(
                 "num_target_verify_tokens may differ from "
                 "num_speculative_tokens only when method == 'dflash'."
->>>>>>> Stashed changes
             )
 
         if self.draft_model_config:
