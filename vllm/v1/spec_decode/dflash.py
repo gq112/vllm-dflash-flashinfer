@@ -7,13 +7,20 @@ from typing import Any
 import torch
 from typing_extensions import override
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.triton_utils import triton
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.spec_decode.utils import copy_and_expand_dflash_inputs_kernel
+from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
 
@@ -67,6 +74,93 @@ class DFlashProposer(SpecDecodeBaseProposer):
 
         # For DFlash we use the input embeddings to embed the mask token
         self.parallel_drafting_hidden_state_tensor = None
+
+    @staticmethod
+    def _get_attention_group_key(
+        layer: AttentionLayerBase,
+    ) -> tuple[int, float | None, float | None, bool | None]:
+        impl = layer.impl
+        window_size = getattr(impl, "sliding_window", None)
+        if isinstance(window_size, (tuple, list)):
+            window_left = window_size[0]
+        else:
+            window_left = -1 if window_size is None else window_size
+        return (
+            window_left,
+            getattr(impl, "logits_soft_cap", None),
+            getattr(impl, "scale", None),
+            getattr(impl, "sinks", None) is not None,
+        )
+
+    @override
+    def initialize_attn_backend(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kernel_block_sizes: list[int] | None = None,
+    ) -> None:
+        all_attn_layers = get_layers_from_vllm_config(
+            self.vllm_config,
+            AttentionLayerBase,  # type: ignore[type-abstract]
+        )
+
+        self.validate_same_kv_cache_group(kv_cache_config)
+        kv_cache_spec = None
+        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+            if self._draft_attn_layer_names & set(group.layer_names):
+                self.kv_cache_gid = gid
+                kv_cache_spec = group.kv_cache_spec
+                break
+
+        attention_groups: dict[
+            tuple[
+                str,
+                KVCacheSpec,
+                tuple[int, float | None, float | None, bool | None],
+            ],
+            AttentionGroup,
+        ] = {}
+        if kv_cache_spec is not None:
+            for layer_name in self._draft_attn_layer_names:
+                layer_kv_cache_spec = kv_cache_spec
+                if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
+                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[
+                        layer_name
+                    ]
+
+                layer = all_attn_layers[layer_name]
+                attn_backend = layer.get_attn_backend()
+                group_key = (
+                    attn_backend.full_cls_name(),
+                    layer_kv_cache_spec,
+                    self._get_attention_group_key(layer),
+                )
+                if group_key not in attention_groups:
+                    kernel_block_size = (
+                        kernel_block_sizes[self.kv_cache_gid]
+                        if kernel_block_sizes is not None
+                        and self.kv_cache_gid < len(kernel_block_sizes)
+                        else None
+                    )
+                    attn_group = AttentionGroup(
+                        backend=attn_backend,
+                        layer_names=[layer_name],
+                        kv_cache_spec=layer_kv_cache_spec,
+                        kv_cache_group_id=self.kv_cache_gid,
+                    )
+                    attn_group.create_metadata_builders(
+                        self.vllm_config,
+                        self.device,
+                        kernel_block_size=kernel_block_size,
+                    )
+                    attention_groups[group_key] = attn_group
+                else:
+                    attention_groups[group_key].layer_names.append(layer_name)
+
+        self.draft_attn_groups = list(attention_groups.values())
+        self.block_size = (
+            self.draft_attn_groups[0].get_metadata_builder().kv_cache_spec.block_size
+        )
+        logger.debug("Using block size %d for drafting layers", self.block_size)
 
     @override
     def _create_draft_vllm_config(self) -> VllmConfig:
@@ -278,10 +372,33 @@ class DFlashProposer(SpecDecodeBaseProposer):
     def build_per_group_and_layer_attn_metadata(
         self, cad: CommonAttentionMetadata, draft_index: int = 0
     ) -> tuple[list[object], dict[str, object]]:
-        per_group, per_layer = super().build_per_group_and_layer_attn_metadata(
-            cad, draft_index
+        per_group: list[object] = []
+        per_layer: dict[str, object] = {}
+        sliding_layer_names: set[str] = getattr(
+            self.model, "sliding_attention_layer_names", set()
         )
+        for attn_group in self.draft_attn_groups:
+            group_layer_names = set(attn_group.layer_names)
+            sliding_layers = sliding_layer_names & group_layer_names
+            assert not (
+                sliding_layers and group_layer_names - sliding_layer_names
+            ), "DFlash attention groups must not mix SWA and full layers."
+            group_cad = cad.replace(causal=bool(sliding_layers))
+            attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
+                common_attn_metadata=group_cad,
+                draft_index=draft_index,
+            )
+            per_group.append(attn_metadata)
+            for layer_name in attn_group.layer_names:
+                per_layer[layer_name] = attn_metadata
+
         for layer_name, attn_metadata in per_layer.items():
+            if layer_name in sliding_layer_names:
+                assert getattr(attn_metadata, "causal", None) is True, (
+                    f"Attention metadata for sliding layer {layer_name} does not have"
+                    " causal support, which is required for DFlash SWA."
+                )
+                continue
             assert getattr(attn_metadata, "causal", None) is False, (
                 f"Attention metadata for layer {layer_name} does not have"
                 " non-causal support, which is required for DFlash."
