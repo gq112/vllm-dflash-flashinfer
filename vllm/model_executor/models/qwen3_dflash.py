@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 import torch
 import torch.nn.functional as F
@@ -79,9 +79,9 @@ def _get_dflash_layer_types(config: Qwen3Config) -> tuple[str, ...]:
 class DFlashAttention(Attention):
     """Attention with DFlash-specific KV allocation semantics.
 
-    The compute path keeps the layer's sliding window. The KV cache spec is
-    widened to full attention because DFlash writes every context KV before
-    drafting and cannot evict old context blocks from draft layers.
+    The compute path keeps the layer's configured sliding window. The KV cache
+    spec is widened to full attention because DFlash writes every context KV
+    before drafting and cannot evict old context blocks from draft layers.
     """
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
@@ -95,7 +95,6 @@ class DFlashAttention(Attention):
                 dtype=spec.dtype,
                 kv_quant_mode=spec.kv_quant_mode,
                 page_size_padded=spec.page_size_padded,
-                sliding_window=spec.sliding_window,
             )
         return spec
 
@@ -218,6 +217,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_type = layer_type
         set_default_rope_theta(config, default_theta=1000000)
         attn_type = AttentionType.DECODER
         sliding_window = (
@@ -308,19 +308,17 @@ class DFlashQwen3Model(nn.Module):
             [
                 DFlashQwen3DecoderLayer(
                     current_vllm_config,
-                    config=self.config,
-                    cache_config=current_vllm_config.cache_config,
-                    quant_config=self.quant_config,
-                    layer_type=self.layer_types[layer_idx],
                     prefix=maybe_prefix(prefix, f"layers.{layer_idx + start_layer_id}"),
+                    config=self.config,
+                    layer_type=self.layer_types[layer_idx],
                 )
                 for layer_idx in range(self.config.num_hidden_layers)
             ]
         )
         self.sliding_attention_layer_names = {
             layer.self_attn.attn.layer_name
-            for layer, layer_type in zip(self.layers, self.layer_types)
-            if layer_type == "sliding_attention"
+            for layer in self.layers
+            if layer.layer_type == "sliding_attention"
         }
         if self.use_aux_hidden_state:
             num_features_to_use = self.config.num_hidden_layers
@@ -412,7 +410,7 @@ class DFlashQwen3Model(nn.Module):
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mapping: torch.Tensor | None = None,
+        context_slot_mapping: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
     ) -> None:
         """Precompute K/V for context states write them into each layer's KV cache.
 
@@ -493,13 +491,18 @@ class DFlashQwen3Model(nn.Module):
         all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
         for i in range(L):
             attn = self._attn_layers[i]
+            layer_slot_mapping = (
+                context_slot_mapping[attn.layer_name]
+                if isinstance(context_slot_mapping, Mapping)
+                else context_slot_mapping
+            )
             kv_cache = attn.kv_cache
             attn.impl.do_kv_cache_update(
                 attn,
                 all_k_final[i],
                 all_v[i],
                 kv_cache,
-                context_slot_mapping,
+                layer_slot_mapping,
             )
 
     def forward(
@@ -579,7 +582,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self.config.target_layer_count = target_layer_num
         self.model = DFlashQwen3Model(
             vllm_config=vllm_config,
-            prefix=maybe_prefix(prefix, "model"),
+            prefix="model",
             start_layer_id=target_layer_num,
         )
 
@@ -590,7 +593,8 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(
-            self.config.draft_vocab_size, scale=logit_scale
+            self.config.draft_vocab_size,
+            scale=logit_scale,
         )
         target_vocab_size = vllm_config.model_config.get_vocab_size()
         if self.config.draft_vocab_size != target_vocab_size:
@@ -638,7 +642,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mapping: torch.Tensor | None = None,
+        context_slot_mapping: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
     ) -> None:
         """Precompute projected + RoPE'd K/V and write to cache."""
         self.model.precompute_and_store_context_kv(
