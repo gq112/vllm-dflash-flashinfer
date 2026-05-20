@@ -25,7 +25,6 @@ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import (
     AttentionGroup,
     bind_kv_cache,
-    get_attention_metadata_group_key,
     prepare_kernel_block_sizes,
 )
 
@@ -85,8 +84,8 @@ def init_attn_backend(
             if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                 layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
 
-            metadata_group_key = get_attention_metadata_group_key(
-                attn_backend, attn_layers[layer_name]
+            metadata_group_key = attn_backend.get_metadata_group_key(
+                attn_layers[layer_name]
             )
             key = (
                 attn_backend.full_cls_name(),

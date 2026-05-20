@@ -216,7 +216,6 @@ from .utils import (
     KVBlockZeroer,
     add_kv_sharing_layers_to_kv_cache_groups,
     bind_kv_cache,
-    get_attention_metadata_group_key,
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
 )
@@ -6563,8 +6562,8 @@ class GPUModelRunner(
                 layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
                 if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                     layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
-                metadata_group_key = get_attention_metadata_group_key(
-                    attn_backend, layers[layer_name]
+                metadata_group_key = attn_backend.get_metadata_group_key(
+                    layers[layer_name]
                 )
                 key = (full_cls_name, layer_kv_cache_spec, metadata_group_key)
                 attn_backends[key] = AttentionGroupKey(

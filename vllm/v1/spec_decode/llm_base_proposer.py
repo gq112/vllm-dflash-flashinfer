@@ -51,10 +51,7 @@ from vllm.v1.spec_decode.utils import (
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
-from vllm.v1.worker.utils import (
-    AttentionGroup,
-    get_attention_metadata_group_key,
-)
+from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
 
@@ -1593,9 +1590,7 @@ class SpecDecodeBaseProposer:
             attn_layer = all_attn_layers[layer_name]
             attn_backend = attn_layer.get_attn_backend()
             backend_key = attn_backend.full_cls_name()
-            metadata_group_key = get_attention_metadata_group_key(
-                attn_backend, attn_layer
-            )
+            metadata_group_key = attn_backend.get_metadata_group_key(attn_layer)
             group_key = (gid, backend_key, layer_kv_cache_spec, metadata_group_key)
             if group_key not in attention_groups:
                 kernel_block_size = (

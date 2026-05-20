@@ -4,7 +4,7 @@
 
 from dataclasses import dataclass
 from functools import partial
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -347,6 +347,17 @@ class FlashInferBackend(AttentionBackend):
     @classmethod
     def supports_non_causal(cls) -> bool:
         return True
+
+    @classmethod
+    def get_metadata_group_key(cls, attn_layer: Any) -> tuple[Any, ...]:
+        impl = attn_layer.impl
+        scale = getattr(impl, "scale", None)
+        return (
+            getattr(impl, "window_left", None),
+            getattr(impl, "logits_soft_cap", None),
+            float(scale) if scale is not None else None,
+            getattr(impl, "sinks", None) is not None,
+        )
 
     @staticmethod
     def get_impl_cls() -> type["FlashInferImpl"]:
