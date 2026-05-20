@@ -25,6 +25,7 @@ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import (
     AttentionGroup,
     bind_kv_cache,
+    get_attention_metadata_group_key,
     prepare_kernel_block_sizes,
 )
 
@@ -71,8 +72,10 @@ def init_attn_backend(
         layer_type = cast(type[Any], AttentionLayerBase)
         attn_layers = get_layers_from_vllm_config(vllm_config, layer_type, layer_names)
 
-        group_map: dict[tuple[tuple[str, str], KVCacheSpec], AttentionGroup] = {}
-        group_order: list[tuple[tuple[str, str], KVCacheSpec]] = []
+        group_map: dict[
+            tuple[tuple[str, str], KVCacheSpec, tuple[Any, ...]], AttentionGroup
+        ] = {}
+        group_order: list[tuple[tuple[str, str], KVCacheSpec, tuple[Any, ...]]] = []
 
         for layer_name in layer_names:
             attn_backend = attn_layers[layer_name].get_attn_backend()
@@ -82,7 +85,14 @@ def init_attn_backend(
             if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                 layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
 
-            key = (attn_backend.full_cls_name(), layer_kv_cache_spec)
+            metadata_group_key = get_attention_metadata_group_key(
+                attn_backend, attn_layers[layer_name]
+            )
+            key = (
+                attn_backend.full_cls_name(),
+                layer_kv_cache_spec,
+                metadata_group_key,
+            )
             if key not in group_map:
                 group_map[key] = AttentionGroup(
                     attn_backend,

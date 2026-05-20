@@ -51,7 +51,10 @@ from vllm.v1.spec_decode.utils import (
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
-from vllm.v1.worker.utils import AttentionGroup
+from vllm.v1.worker.utils import (
+    AttentionGroup,
+    get_attention_metadata_group_key,
+)
 
 logger = init_logger(__name__)
 
@@ -1578,7 +1581,7 @@ class SpecDecodeBaseProposer:
         self.kv_cache_gid = self._draft_kv_cache_group_ids[0]
 
         attention_groups: dict[
-            tuple[int, tuple[str, str], KVCacheSpec], AttentionGroup
+            tuple[int, tuple[str, str], KVCacheSpec, tuple[Any, ...]], AttentionGroup
         ] = {}
         for layer_name in self._draft_attn_layer_names:
             gid = self._draft_layer_to_kv_cache_gid[layer_name]
@@ -1587,9 +1590,13 @@ class SpecDecodeBaseProposer:
             if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                 layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
 
-            attn_backend = all_attn_layers[layer_name].get_attn_backend()
+            attn_layer = all_attn_layers[layer_name]
+            attn_backend = attn_layer.get_attn_backend()
             backend_key = attn_backend.full_cls_name()
-            group_key = (gid, backend_key, layer_kv_cache_spec)
+            metadata_group_key = get_attention_metadata_group_key(
+                attn_backend, attn_layer
+            )
+            group_key = (gid, backend_key, layer_kv_cache_spec, metadata_group_key)
             if group_key not in attention_groups:
                 kernel_block_size = (
                     kernel_block_sizes[gid]

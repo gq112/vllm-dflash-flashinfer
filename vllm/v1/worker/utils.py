@@ -37,6 +37,22 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 
+def get_attention_metadata_group_key(
+    attn_backend: type[AttentionBackend], attn_layer: Any
+) -> tuple[Any, ...]:
+    if attn_backend.get_name() != "FLASHINFER":
+        return ()
+
+    impl = attn_layer.impl
+    scale = getattr(impl, "scale", None)
+    return (
+        getattr(impl, "window_left", None),
+        getattr(impl, "logits_soft_cap", None),
+        float(scale) if scale is not None else None,
+        getattr(impl, "sinks", None) is not None,
+    )
+
+
 @triton.jit
 def _zero_kv_blocks_kernel(
     seg_addrs_ptr,
