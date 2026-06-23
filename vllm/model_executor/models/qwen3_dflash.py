@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -33,6 +34,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
+from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionType
 
 from .qwen2 import Qwen2MLP as Qwen3MLP
@@ -45,6 +47,113 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+@triton.jit
+def _dflash_k_norm_rope_triton_kernel(
+    all_k,
+    all_k_out,
+    k_norm_weights,
+    positions,
+    cos_sin_cache,
+    num_ctx: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    rotary_dim: tl.constexpr,
+    eps: tl.constexpr,
+    is_neox: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+) -> None:
+    row_idx = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < head_dim
+
+    head_idx = row_idx % num_kv_heads
+    token_idx = (row_idx // num_kv_heads) % num_ctx
+    layer_idx = row_idx // (num_ctx * num_kv_heads)
+
+    row_offset = (
+        ((layer_idx * num_ctx + token_idx) * num_kv_heads + head_idx) * head_dim
+    )
+    k = tl.load(all_k + row_offset + offsets, mask=mask, other=0.0).to(tl.float32)
+    weight = tl.load(
+        k_norm_weights + layer_idx * head_dim + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    variance = tl.sum(k * k, axis=0) / head_dim
+    k = k * tl.rsqrt(variance + eps) * weight
+
+    rotary_mask = offsets < rotary_dim
+    pos = tl.load(positions + token_idx)
+    half_rotary_dim: tl.constexpr = rotary_dim // 2
+
+    if is_neox:
+        pair_offsets = tl.where(offsets < half_rotary_dim,
+                                offsets + half_rotary_dim,
+                                offsets - half_rotary_dim)
+        cos_sin_offsets = offsets % half_rotary_dim
+        rotate_sign = tl.where(offsets < half_rotary_dim, -1.0, 1.0)
+    else:
+        pair_offsets = tl.where(offsets % 2 == 0, offsets + 1, offsets - 1)
+        cos_sin_offsets = offsets // 2
+        rotate_sign = tl.where(offsets % 2 == 0, -1.0, 1.0)
+
+    pair_k = tl.load(
+        all_k + row_offset + pair_offsets,
+        mask=rotary_mask,
+        other=0.0,
+    ).to(tl.float32)
+    pair_weight = tl.load(
+        k_norm_weights + layer_idx * head_dim + pair_offsets,
+        mask=rotary_mask,
+        other=0.0,
+    ).to(tl.float32)
+    pair_k = pair_k * tl.rsqrt(variance + eps) * pair_weight
+
+    cos = tl.load(
+        cos_sin_cache + pos * rotary_dim + cos_sin_offsets,
+        mask=rotary_mask,
+        other=1.0,
+    ).to(tl.float32)
+    sin = tl.load(
+        cos_sin_cache + pos * rotary_dim + half_rotary_dim + cos_sin_offsets,
+        mask=rotary_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    rotated = k * cos + rotate_sign * pair_k * sin
+    k = tl.where(rotary_mask, rotated, k)
+    tl.store(all_k_out + row_offset + offsets, k, mask=mask)
+
+
+def _dflash_k_norm_rope_triton(
+    all_k: torch.Tensor,
+    all_k_out: torch.Tensor,
+    k_norm_weights: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    eps: float,
+    is_neox: bool,
+) -> None:
+    num_layers, num_ctx, num_kv_heads, head_dim = all_k.shape
+    rotary_dim = cos_sin_cache.shape[1]
+    grid = (num_layers * num_ctx * num_kv_heads,)
+    _dflash_k_norm_rope_triton_kernel[grid](
+        all_k,
+        all_k_out,
+        k_norm_weights,
+        positions,
+        cos_sin_cache,
+        num_ctx,
+        num_kv_heads,
+        head_dim,
+        rotary_dim,
+        eps,
+        is_neox,
+        BLOCK_SIZE=triton.next_power_of_2(head_dim),
+    )
 
 
 class DFlashQwen3Attention(nn.Module):
@@ -405,12 +514,20 @@ class DFlashQwen3Model(nn.Module):
         # one RMSNorm launch per layer and avoids materializing
         # context_positions.repeat(L). Fall back to the existing vLLM ops for
         # unsupported builds or shapes.
-        if (
+        k_norm_rope_impl = os.environ.get(
+            "VLLM_DFLASH_K_NORM_ROPE_IMPL",
+            "cuda",
+        ).lower()
+        can_fuse_k_norm_rope = (
             all_k.is_cuda
-            and hasattr(torch.ops._C, "dflash_k_norm_rope")
             and self._rope_head_size == hd
             and hd in (64, 128, 256)
             and cos_sin_cache.shape[1] % (hd // 32) == 0
+        )
+        if (
+            k_norm_rope_impl == "cuda"
+            and can_fuse_k_norm_rope
+            and hasattr(torch.ops._C, "dflash_k_norm_rope")
         ):
             all_k_final = torch.empty_like(all_k)
             ops.dflash_k_norm_rope(
@@ -423,7 +540,24 @@ class DFlashQwen3Model(nn.Module):
                 self._rope_is_neox,
                 self._rms_norm_eps,
             )
+        elif k_norm_rope_impl == "triton" and can_fuse_k_norm_rope:
+            all_k_final = torch.empty_like(all_k)
+            _dflash_k_norm_rope_triton(
+                all_k,
+                all_k_final,
+                self._stacked_k_norm_weights,
+                context_positions,
+                cos_sin_cache,
+                self._rms_norm_eps,
+                self._rope_is_neox,
+            )
         else:
+            if k_norm_rope_impl not in ("cuda", "triton", "none", "fallback"):
+                logger.warning_once(
+                    "Unknown VLLM_DFLASH_K_NORM_ROPE_IMPL=%s; falling back to "
+                    "unfused DFlash K norm + RoPE",
+                    k_norm_rope_impl,
+                )
             all_k_final = torch.empty_like(all_k)
             for i in range(L):
                 ops.rms_norm(

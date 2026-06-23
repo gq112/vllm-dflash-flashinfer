@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.model_executor.models.qwen3_dflash import _dflash_k_norm_rope_triton
 
 
 def _op_available() -> bool:
@@ -124,9 +125,20 @@ def test_dflash_k_norm_rope_matches_reference(
         is_neox,
         eps,
     )
+    actual_triton = torch.empty_like(all_k)
+    _dflash_k_norm_rope_triton(
+        all_k,
+        actual_triton,
+        k_norm_weights,
+        positions,
+        cos_sin_cache,
+        eps,
+        is_neox,
+    )
 
     if dtype == torch.float16:
         atol, rtol = 2e-3, 2e-3
     else:
         atol, rtol = 1e-2, 1e-2
     torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    torch.testing.assert_close(actual_triton, expected, atol=atol, rtol=rtol)
