@@ -363,6 +363,28 @@ def fused_qk_norm_rope(
     )
 
 
+def dflash_k_norm_rope(
+    all_k: torch.Tensor,
+    all_k_out: torch.Tensor,
+    k_norm_weights: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    rope_head_size: int,
+    is_neox: bool,
+    eps: float,
+) -> None:
+    torch.ops._C.dflash_k_norm_rope(
+        all_k,
+        all_k_out,
+        k_norm_weights,
+        positions,
+        cos_sin_cache,
+        rope_head_size,
+        is_neox,
+        eps,
+    )
+
+
 def apply_repetition_penalties_torch(
     logits: torch.Tensor,
     prompt_mask: torch.Tensor,

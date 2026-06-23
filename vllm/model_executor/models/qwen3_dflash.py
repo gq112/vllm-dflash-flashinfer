@@ -311,6 +311,10 @@ class DFlashQwen3Model(nn.Module):
 
         # K-norm weights: list of [head_dim] tensors, one per layer.
         self._k_norm_weights = [a.k_norm.weight.data for a in layers_attn]
+        self._stacked_k_norm_weights = torch.stack(
+            self._k_norm_weights,
+            dim=0,
+        ).contiguous()
 
         # RoPE parameters
         self._rope_head_size = attn0.rotary_emb.head_size
@@ -392,38 +396,59 @@ class DFlashQwen3Model(nn.Module):
         all_k = all_kv[0]  # [L, num_ctx, nkv, hd], contiguous
         all_v = all_kv[1]  # [L, num_ctx, nkv, hd], contiguous
 
-        # --- Per-layer RMSNorm K (3D: [num_ctx, nkv, hd] per layer) ---
-        all_k_normed = torch.empty_like(all_k)
-        for i in range(L):
-            ops.rms_norm(
-                all_k_normed[i],
-                all_k[i],
-                self._k_norm_weights[i],
+        cos_sin_cache = self._rope_cos_sin_cache
+        if cos_sin_cache.dtype != all_k.dtype:
+            cos_sin_cache = cos_sin_cache.to(dtype=all_k.dtype)
+
+        # --- Fused per-layer RMSNorm K + RoPE ---
+        # DFlash context K has shape [L, num_ctx, nkv, hd]. The fused op avoids
+        # one RMSNorm launch per layer and avoids materializing
+        # context_positions.repeat(L). Fall back to the existing vLLM ops for
+        # unsupported builds or shapes.
+        if (
+            all_k.is_cuda
+            and hasattr(torch.ops._C, "dflash_k_norm_rope")
+            and self._rope_head_size == hd
+            and hd in (64, 128, 256)
+            and cos_sin_cache.shape[1] % (hd // 32) == 0
+        ):
+            all_k_final = torch.empty_like(all_k)
+            ops.dflash_k_norm_rope(
+                all_k,
+                all_k_final,
+                self._stacked_k_norm_weights,
+                context_positions,
+                cos_sin_cache,
+                self._rope_head_size,
+                self._rope_is_neox,
                 self._rms_norm_eps,
             )
+        else:
+            all_k_final = torch.empty_like(all_k)
+            for i in range(L):
+                ops.rms_norm(
+                    all_k_final[i],
+                    all_k[i],
+                    self._k_norm_weights[i],
+                    self._rms_norm_eps,
+                )
 
-        # --- Fused RoPE across all layers ---
-        # View as [L * num_ctx, kv] so RoPE sees one big batch (no copy).
-        # In-place RoPE: pass K as the "query" arg with key=None.
-        all_k_flat = all_k_normed.view(L * num_ctx, kv)
-        positions_repeated = context_positions.repeat(L)
-        cos_sin_cache = self._rope_cos_sin_cache
-        if cos_sin_cache.dtype != all_k_flat.dtype:
-            cos_sin_cache = cos_sin_cache.to(dtype=all_k_flat.dtype)
-        ops.rotary_embedding(
-            positions_repeated,
-            all_k_flat,
-            None,
-            self._rope_head_size,
-            cos_sin_cache,
-            self._rope_is_neox,
-        )
+            # View as [L * num_ctx, kv] so RoPE sees one big batch (no copy).
+            # In-place RoPE: pass K as the "query" arg with key=None.
+            all_k_flat = all_k_final.view(L * num_ctx, kv)
+            ops.rotary_embedding(
+                context_positions.repeat(L),
+                all_k_flat,
+                None,
+                self._rope_head_size,
+                cos_sin_cache,
+                self._rope_is_neox,
+            )
 
         if context_slot_mapping is None:
             return
 
         # --- Per-layer cache insert ---
-        all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
         for i in range(L):
             attn = self._attn_layers[i]
             kv_cache = attn.kv_cache
