@@ -279,6 +279,15 @@ void dflash_k_norm_rope_cache_update(
     torch::stable::Tensor const& slot_mapping, int64_t rope_head_size,
     bool is_neox, double eps);
 
+void dflash_k_norm_rope_multi_cache_update(
+    torch::stable::Tensor const& all_k, torch::stable::Tensor const& all_v,
+    torch::stable::Tensor& key_cache, torch::stable::Tensor& value_cache,
+    torch::stable::Tensor const& k_norm_weights,
+    torch::stable::Tensor const& positions,
+    torch::stable::Tensor const& cos_sin_cache,
+    torch::stable::Tensor const& slot_mapping, int64_t rope_head_size,
+    bool is_neox, double eps);
+
 torch::stable::Tensor fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     torch::stable::Tensor const& q_in, torch::stable::Tensor const& kv,
     torch::stable::Tensor& k_cache, torch::stable::Tensor const& slot_mapping,

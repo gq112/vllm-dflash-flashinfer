@@ -413,6 +413,34 @@ def dflash_k_norm_rope_cache_update(
     )
 
 
+def dflash_k_norm_rope_multi_cache_update(
+    all_k: torch.Tensor,
+    all_v: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    k_norm_weights: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    rope_head_size: int,
+    is_neox: bool,
+    eps: float,
+) -> None:
+    torch.ops._C.dflash_k_norm_rope_multi_cache_update(
+        all_k,
+        all_v,
+        key_cache,
+        value_cache,
+        k_norm_weights,
+        positions,
+        cos_sin_cache,
+        slot_mapping,
+        rope_head_size,
+        is_neox,
+        eps,
+    )
+
+
 def apply_repetition_penalties_torch(
     logits: torch.Tensor,
     prompt_mask: torch.Tensor,

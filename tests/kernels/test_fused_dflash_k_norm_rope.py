@@ -16,6 +16,18 @@ def _cache_update_op_available() -> bool:
     return hasattr(torch.ops._C, "dflash_k_norm_rope_cache_update")
 
 
+def _multi_cache_update_op_available() -> bool:
+    return hasattr(torch.ops._C, "dflash_k_norm_rope_multi_cache_update")
+
+
+def _triton_cache_update_available() -> bool:
+    try:
+        import vllm.model_executor.kernels.dflash_triton  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not _op_available(),
     reason="CUDA not available or fused DFlash K norm + RoPE op not built in",
@@ -273,6 +285,203 @@ def test_dflash_k_norm_rope_cache_update_matches_reference(
         head_dim,
         is_neox,
         eps,
+    )
+
+    if dtype == torch.float16:
+        atol, rtol = 2e-3, 2e-3
+    else:
+        atol, rtol = 1e-2, 1e-2
+    torch.testing.assert_close(actual_kv_cache, expected_kv_cache, atol=atol,
+                               rtol=rtol)
+
+
+def make_multi_cache_update_case(
+    dtype: torch.dtype,
+    is_neox: bool,
+) -> tuple[torch.Tensor, ...]:
+    torch.manual_seed(0)
+    device = "cuda"
+    max_pos = 4096
+    num_ctx = 19
+    num_layers = 3
+    num_kv_heads = 4
+    head_dim = 128
+
+    all_k = torch.randn(
+        num_layers,
+        num_ctx,
+        num_kv_heads,
+        head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    all_v = torch.randn_like(all_k)
+    all_kv_flat = torch.empty(
+        num_ctx,
+        num_layers,
+        2,
+        num_kv_heads,
+        head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    all_kv_flat[:, :, 0].copy_(all_k.permute(1, 0, 2, 3))
+    all_kv_flat[:, :, 1].copy_(all_v.permute(1, 0, 2, 3))
+    strided_all_k = all_kv_flat[:, :, 0].permute(1, 0, 2, 3)
+    strided_all_v = all_kv_flat[:, :, 1].permute(1, 0, 2, 3)
+
+    k_norm_weights = torch.randn(
+        num_layers,
+        head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    positions = torch.randint(
+        0,
+        max_pos,
+        (num_ctx,),
+        dtype=torch.int64,
+        device=device,
+    )
+    slot_mapping = torch.tensor(
+        [0, 3, 7, 15, 16, 17, 18, 24, 25, 26, 31, 32, 33, 42, 47, -1, 48, 49, 50],
+        dtype=torch.int64,
+        device=device,
+    )
+    cos_sin_cache = make_cos_sin_cache(max_pos, head_dim, dtype, device)
+
+    expected_k = reference_dflash_k_norm_rope(
+        all_k,
+        k_norm_weights,
+        positions,
+        cos_sin_cache,
+        is_neox,
+        1e-6,
+    )
+    expected_kv_cache = torch.zeros(
+        num_layers,
+        4,
+        2,
+        16,
+        num_kv_heads,
+        head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    for layer_idx in range(num_layers):
+        for token_idx, slot in enumerate(slot_mapping.cpu().tolist()):
+            if slot < 0:
+                continue
+            expected_kv_cache[
+                layer_idx,
+                slot // 16,
+                0,
+                slot % 16,
+            ] = expected_k[layer_idx, token_idx]
+            expected_kv_cache[
+                layer_idx,
+                slot // 16,
+                1,
+                slot % 16,
+            ] = all_v[layer_idx, token_idx]
+
+    return (
+        strided_all_k,
+        strided_all_v,
+        k_norm_weights,
+        positions,
+        cos_sin_cache,
+        slot_mapping,
+        expected_kv_cache,
+    )
+
+
+@pytest.mark.skipif(
+    not _multi_cache_update_op_available(),
+    reason="fused DFlash multi-cache update op not built in",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("is_neox", [True, False])
+@torch.inference_mode()
+def test_dflash_k_norm_rope_multi_cache_update_matches_reference(
+    dtype: torch.dtype,
+    is_neox: bool,
+) -> None:
+    (
+        all_k,
+        all_v,
+        k_norm_weights,
+        positions,
+        cos_sin_cache,
+        slot_mapping,
+        expected_kv_cache,
+    ) = make_multi_cache_update_case(dtype, is_neox)
+    actual_kv_cache = torch.zeros_like(expected_kv_cache)
+    key_cache = actual_kv_cache[:, :, 0]
+    value_cache = actual_kv_cache[:, :, 1]
+
+    ops.dflash_k_norm_rope_multi_cache_update(
+        all_k,
+        all_v,
+        key_cache,
+        value_cache,
+        k_norm_weights,
+        positions,
+        cos_sin_cache,
+        slot_mapping,
+        all_k.shape[-1],
+        is_neox,
+        1e-6,
+    )
+
+    if dtype == torch.float16:
+        atol, rtol = 2e-3, 2e-3
+    else:
+        atol, rtol = 1e-2, 1e-2
+    torch.testing.assert_close(actual_kv_cache, expected_kv_cache, atol=atol,
+                               rtol=rtol)
+
+
+@pytest.mark.skipif(
+    not _triton_cache_update_available(),
+    reason="DFlash Triton multi-cache update kernel not available",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("is_neox", [True, False])
+@torch.inference_mode()
+def test_dflash_triton_k_norm_rope_multi_cache_update_matches_reference(
+    dtype: torch.dtype,
+    is_neox: bool,
+) -> None:
+    from vllm.model_executor.kernels.dflash_triton import (
+        dflash_k_norm_rope_multi_cache_update,
+    )
+
+    (
+        all_k,
+        all_v,
+        k_norm_weights,
+        positions,
+        cos_sin_cache,
+        slot_mapping,
+        expected_kv_cache,
+    ) = make_multi_cache_update_case(dtype, is_neox)
+    actual_kv_cache = torch.zeros_like(expected_kv_cache)
+    key_cache = actual_kv_cache[:, :, 0]
+    value_cache = actual_kv_cache[:, :, 1]
+
+    dflash_k_norm_rope_multi_cache_update(
+        all_k,
+        all_v,
+        key_cache,
+        value_cache,
+        k_norm_weights,
+        positions,
+        cos_sin_cache,
+        slot_mapping,
+        all_k.shape[-1],
+        is_neox,
+        1e-6,
     )
 
     if dtype == torch.float16:

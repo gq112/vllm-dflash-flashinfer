@@ -346,6 +346,52 @@ class DFlashQwen3Model(nn.Module):
         # References to inner Attention layers for direct cache writes
         self._attn_layers = [layer.self_attn.attn for layer in self.layers]
 
+    @staticmethod
+    def _stack_cache_views(
+        cache_targets: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        def stack_views(tensors: list[torch.Tensor]) -> torch.Tensor | None:
+            first = tensors[0]
+            storage_ptr = first.untyped_storage().data_ptr()
+            shape = first.shape
+            stride = first.stride()
+            offsets: list[int] = []
+            for tensor in tensors:
+                if (
+                    tensor.untyped_storage().data_ptr() != storage_ptr
+                    or tensor.shape != shape
+                    or tensor.stride() != stride
+                    or tensor.dtype != first.dtype
+                    or tensor.device != first.device
+                ):
+                    return None
+                offsets.append(tensor.storage_offset())
+
+            if len(offsets) == 1:
+                layer_stride = 0
+            else:
+                layer_stride = offsets[1] - offsets[0]
+                if layer_stride <= 0:
+                    return None
+                for i, offset in enumerate(offsets):
+                    if offset != offsets[0] + i * layer_stride:
+                        return None
+
+            return torch.as_strided(
+                first,
+                size=(len(tensors), *shape),
+                stride=(layer_stride, *stride),
+                storage_offset=offsets[0],
+            )
+
+        key_cache = stack_views([target[0] for target in cache_targets])
+        if key_cache is None:
+            return None
+        value_cache = stack_views([target[1] for target in cache_targets])
+        if value_cache is None:
+            return None
+        return key_cache, value_cache
+
     def precompute_and_store_context_kv(
         self,
         context_states: torch.Tensor,
@@ -409,17 +455,28 @@ class DFlashQwen3Model(nn.Module):
         ).lower()
         can_fuse_k_norm_rope = (
             all_k.is_cuda
+            and all_k.dtype in (torch.float16, torch.bfloat16)
             and self._rope_head_size == hd
             and all_k.stride(-1) == 1
             and all_k.stride(-2) == hd
             and hd in (64, 128, 256)
             and cos_sin_cache.shape[1] % (hd // 32) == 0
         )
+        has_single_cache_update = hasattr(
+            torch.ops._C, "dflash_k_norm_rope_cache_update"
+        )
+        has_multi_cache_update = hasattr(
+            torch.ops._C, "dflash_k_norm_rope_multi_cache_update"
+        )
         can_fuse_cache_update = (
-            k_norm_rope_impl == "cuda_cache"
+            k_norm_rope_impl in ("cuda_cache", "cuda_multi", "triton_cache")
             and context_slot_mapping is not None
             and can_fuse_k_norm_rope
-            and hasattr(torch.ops._C, "dflash_k_norm_rope_cache_update")
+            and (
+                k_norm_rope_impl == "triton_cache"
+                or has_single_cache_update
+                or has_multi_cache_update
+            )
         )
         if can_fuse_cache_update:
             cache_targets: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -455,24 +512,70 @@ class DFlashQwen3Model(nn.Module):
                 cache_targets.append((key_cache, value_cache))
 
             if cache_targets:
-                for i, (key_cache, value_cache) in enumerate(cache_targets):
-                    ops.dflash_k_norm_rope_cache_update(
-                        all_k[i],
-                        all_v[i],
-                        key_cache,
-                        value_cache,
-                        self._k_norm_weights[i],
-                        context_positions,
-                        cos_sin_cache,
-                        context_slot_mapping,
-                        self._rope_head_size,
-                        self._rope_is_neox,
-                        self._rms_norm_eps,
-                    )
-                return
+                stacked_cache = self._stack_cache_views(cache_targets)
+                if stacked_cache is not None:
+                    key_cache, value_cache = stacked_cache
+                    if (
+                        k_norm_rope_impl == "triton_cache"
+                        and all_k.dtype in (torch.float16, torch.bfloat16)
+                    ):
+                        from vllm.model_executor.kernels.dflash_triton import (
+                            dflash_k_norm_rope_multi_cache_update,
+                        )
+
+                        dflash_k_norm_rope_multi_cache_update(
+                            all_k,
+                            all_v,
+                            key_cache,
+                            value_cache,
+                            self._stacked_k_norm_weights,
+                            context_positions,
+                            cos_sin_cache,
+                            context_slot_mapping,
+                            self._rope_head_size,
+                            self._rope_is_neox,
+                            self._rms_norm_eps,
+                        )
+                        return
+
+                    if (
+                        k_norm_rope_impl in ("cuda_cache", "cuda_multi")
+                        and has_multi_cache_update
+                    ):
+                        ops.dflash_k_norm_rope_multi_cache_update(
+                            all_k,
+                            all_v,
+                            key_cache,
+                            value_cache,
+                            self._stacked_k_norm_weights,
+                            context_positions,
+                            cos_sin_cache,
+                            context_slot_mapping,
+                            self._rope_head_size,
+                            self._rope_is_neox,
+                            self._rms_norm_eps,
+                        )
+                        return
+
+                if has_single_cache_update:
+                    for i, (key_cache, value_cache) in enumerate(cache_targets):
+                        ops.dflash_k_norm_rope_cache_update(
+                            all_k[i],
+                            all_v[i],
+                            key_cache,
+                            value_cache,
+                            self._k_norm_weights[i],
+                            context_positions,
+                            cos_sin_cache,
+                            context_slot_mapping,
+                            self._rope_head_size,
+                            self._rope_is_neox,
+                            self._rms_norm_eps,
+                        )
+                    return
 
         if (
-            k_norm_rope_impl in ("cuda", "cuda_cache")
+            k_norm_rope_impl in ("cuda", "cuda_cache", "cuda_multi")
             and can_fuse_k_norm_rope
             and hasattr(torch.ops._C, "dflash_k_norm_rope")
         ):
@@ -491,6 +594,8 @@ class DFlashQwen3Model(nn.Module):
             if k_norm_rope_impl not in (
                 "cuda",
                 "cuda_cache",
+                "cuda_multi",
+                "triton_cache",
                 "none",
                 "fallback",
             ):
