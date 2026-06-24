@@ -565,7 +565,7 @@ class DFlashQwen3Model(nn.Module):
         # unsupported builds or shapes.
         k_norm_rope_impl = os.environ.get(
             "VLLM_DFLASH_K_NORM_ROPE_IMPL",
-            "cuda",
+            "cuda_cache",
         ).lower()
         can_fuse_k_norm_rope = (
             all_k.is_cuda
@@ -575,8 +575,64 @@ class DFlashQwen3Model(nn.Module):
             and hd in (64, 128, 256)
             and cos_sin_cache.shape[1] % (hd // 32) == 0
         )
+        can_fuse_cache_update = (
+            k_norm_rope_impl == "cuda_cache"
+            and context_slot_mapping is not None
+            and can_fuse_k_norm_rope
+            and hasattr(torch.ops._C, "dflash_k_norm_rope_cache_update")
+        )
+        if can_fuse_cache_update:
+            cache_targets: list[tuple[torch.Tensor, torch.Tensor]] = []
+            for attn in self._attn_layers:
+                kv_cache = attn.kv_cache
+                kv_cache_dtype = getattr(attn.impl, "kv_cache_dtype", "auto")
+                supports_cache = (
+                    getattr(attn.impl, "kv_sharing_target_layer_name", None)
+                    is None
+                    and kv_cache_dtype in ("auto", "float16", "bfloat16",
+                                           "float32", "half", "float")
+                    and kv_cache.ndim == 5
+                    and kv_cache.shape[1] == 2
+                )
+                if supports_cache:
+                    key_cache = kv_cache[:, 0]
+                    value_cache = kv_cache[:, 1]
+                    supports_cache = (
+                        key_cache.ndim == 4
+                        and value_cache.ndim == 4
+                        and key_cache.dtype == all_k.dtype
+                        and value_cache.dtype == all_k.dtype
+                        and key_cache.shape[2] == nkv
+                        and value_cache.shape[2] == nkv
+                        and key_cache.shape[3] == hd
+                        and value_cache.shape[3] == hd
+                        and key_cache.stride(-1) == 1
+                        and value_cache.stride(-1) == 1
+                    )
+                if not supports_cache:
+                    cache_targets.clear()
+                    break
+                cache_targets.append((key_cache, value_cache))
+
+            if cache_targets:
+                for i, (key_cache, value_cache) in enumerate(cache_targets):
+                    ops.dflash_k_norm_rope_cache_update(
+                        all_k[i],
+                        all_v[i],
+                        key_cache,
+                        value_cache,
+                        self._k_norm_weights[i],
+                        context_positions,
+                        cos_sin_cache,
+                        context_slot_mapping,
+                        self._rope_head_size,
+                        self._rope_is_neox,
+                        self._rms_norm_eps,
+                    )
+                return
+
         if (
-            k_norm_rope_impl == "cuda"
+            k_norm_rope_impl in ("cuda", "cuda_cache")
             and can_fuse_k_norm_rope
             and hasattr(torch.ops._C, "dflash_k_norm_rope")
         ):
@@ -608,7 +664,13 @@ class DFlashQwen3Model(nn.Module):
                 self._rope_is_neox,
             )
         else:
-            if k_norm_rope_impl not in ("cuda", "triton", "none", "fallback"):
+            if k_norm_rope_impl not in (
+                "cuda",
+                "cuda_cache",
+                "triton",
+                "none",
+                "fallback",
+            ):
                 logger.warning_once(
                     "Unknown VLLM_DFLASH_K_NORM_ROPE_IMPL=%s; falling back to "
                     "unfused DFlash K norm + RoPE",

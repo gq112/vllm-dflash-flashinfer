@@ -434,6 +434,12 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "int rope_head_size, bool is_neox, float eps) -> ()");
 
   ops.def(
+      "dflash_k_norm_rope_cache_update(Tensor all_k, Tensor all_v, "
+      "Tensor! key_cache, Tensor! value_cache, Tensor k_norm_weight, "
+      "Tensor positions, Tensor cos_sin_cache, Tensor slot_mapping, "
+      "int rope_head_size, bool is_neox, float eps) -> ()");
+
+  ops.def(
       "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert("
       "Tensor q_in, Tensor kv, Tensor! k_cache, "
       "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
@@ -696,6 +702,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("rotary_embedding", TORCH_BOX(&rotary_embedding));
   ops.impl("fused_qk_norm_rope", TORCH_BOX(&fused_qk_norm_rope));
   ops.impl("dflash_k_norm_rope", TORCH_BOX(&dflash_k_norm_rope));
+  ops.impl("dflash_k_norm_rope_cache_update",
+           TORCH_BOX(&dflash_k_norm_rope_cache_update));
   ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
            TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert));
   ops.impl(
