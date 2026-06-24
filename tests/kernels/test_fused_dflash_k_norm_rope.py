@@ -6,10 +6,7 @@ import pytest
 import torch
 
 from vllm import _custom_ops as ops
-from vllm.model_executor.models.qwen3_dflash import (
-    _dflash_k_norm_rope_cache_triton_qwen3_4kv,
-    _dflash_k_norm_rope_triton,
-)
+from vllm.model_executor.models.qwen3_dflash import _dflash_k_norm_rope_triton
 
 
 def _op_available() -> bool:
@@ -145,93 +142,3 @@ def test_dflash_k_norm_rope_matches_reference(
         atol, rtol = 1e-2, 1e-2
     torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
     torch.testing.assert_close(actual_triton, expected, atol=atol, rtol=rtol)
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("is_neox", [True, False])
-@torch.inference_mode()
-def test_dflash_k_norm_rope_triton_cache_writer_matches_reference(
-    dtype: torch.dtype,
-    is_neox: bool,
-) -> None:
-    torch.manual_seed(0)
-    device = "cuda"
-    eps = 1e-6
-    max_pos = 4096
-    num_ctx = 19
-    num_kv_heads = 4
-    head_dim = 128
-    block_size = 16
-    num_blocks = 4
-
-    all_k = torch.randn(
-        num_ctx,
-        num_kv_heads,
-        head_dim,
-        dtype=dtype,
-        device=device,
-    )
-    all_v = torch.randn_like(all_k)
-    k_norm_weight = torch.randn(head_dim, dtype=dtype, device=device)
-    positions = torch.randint(
-        0,
-        max_pos,
-        (num_ctx,),
-        dtype=torch.int64,
-        device=device,
-    )
-    slot_mapping = torch.tensor(
-        [0, 3, 7, 15, 16, 17, 18, 24, 25, 26, 31, 32, 33, 42, 47, -1, 48, 49, 50],
-        dtype=torch.int64,
-        device=device,
-    )
-    cos_sin_cache = make_cos_sin_cache(max_pos, head_dim, dtype, device)
-
-    expected_k = reference_dflash_k_norm_rope(
-        all_k[None, ...],
-        k_norm_weight[None, ...],
-        positions,
-        cos_sin_cache,
-        is_neox,
-        eps,
-    )[0]
-    expected_key_cache = torch.zeros(
-        num_blocks,
-        block_size,
-        num_kv_heads,
-        head_dim,
-        dtype=dtype,
-        device=device,
-    )
-    expected_value_cache = torch.zeros_like(expected_key_cache)
-    for token_idx, slot in enumerate(slot_mapping.cpu().tolist()):
-        if slot < 0:
-            continue
-        expected_key_cache[slot // block_size, slot % block_size] = expected_k[
-            token_idx
-        ]
-        expected_value_cache[slot // block_size, slot % block_size] = all_v[token_idx]
-
-    actual_key_cache = torch.zeros_like(expected_key_cache)
-    actual_value_cache = torch.zeros_like(expected_value_cache)
-    _dflash_k_norm_rope_cache_triton_qwen3_4kv(
-        all_k,
-        all_v,
-        actual_key_cache,
-        actual_value_cache,
-        k_norm_weight,
-        positions,
-        cos_sin_cache,
-        slot_mapping,
-        eps,
-        is_neox,
-    )
-
-    if dtype == torch.float16:
-        atol, rtol = 2e-3, 2e-3
-    else:
-        atol, rtol = 1e-2, 1e-2
-    torch.testing.assert_close(actual_key_cache, expected_key_cache, atol=atol,
-                               rtol=rtol)
-    torch.testing.assert_close(actual_value_cache, expected_value_cache, atol=0,
-                               rtol=0)
