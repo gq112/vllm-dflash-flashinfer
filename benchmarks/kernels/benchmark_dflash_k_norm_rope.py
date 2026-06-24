@@ -11,7 +11,6 @@ import argparse
 import torch
 
 from vllm import _custom_ops as ops
-from vllm.model_executor.models.qwen3_dflash import _dflash_k_norm_rope_triton
 
 
 def make_cos_sin_cache(
@@ -78,27 +77,6 @@ def run_new_path(
     return out
 
 
-def run_triton_path(
-    all_k: torch.Tensor,
-    k_norm_weights: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    is_neox: bool,
-    eps: float,
-) -> torch.Tensor:
-    out = torch.empty_like(all_k)
-    _dflash_k_norm_rope_triton(
-        all_k,
-        out,
-        k_norm_weights,
-        positions,
-        cos_sin_cache,
-        eps,
-        is_neox,
-    )
-    return out
-
-
 def benchmark(fn, iters: int, warmup: int) -> float:
     for _ in range(warmup):
         fn()
@@ -150,7 +128,7 @@ def main() -> None:
         device=device,
     )
 
-    print("num_ctx,old_ms,cuda_ms,triton_ms,cuda_speedup,triton_speedup")
+    print("num_ctx,old_ms,cuda_ms,cuda_speedup")
     for num_ctx in args.num_ctx:
         all_k = torch.randn(
             args.num_layers,
@@ -182,17 +160,7 @@ def main() -> None:
             args.iters,
             args.warmup,
         )
-        triton_ms = benchmark(
-            lambda: run_triton_path(
-                all_k, k_norm_weights, positions, cos_sin_cache, args.neox, eps
-            ),
-            args.iters,
-            args.warmup,
-        )
-        print(
-            f"{num_ctx},{old_ms:.6f},{new_ms:.6f},{triton_ms:.6f},"
-            f"{old_ms / new_ms:.3f}x,{old_ms / triton_ms:.3f}x"
-        )
+        print(f"{num_ctx},{old_ms:.6f},{new_ms:.6f},{old_ms / new_ms:.3f}x")
 
 
 if __name__ == "__main__":
