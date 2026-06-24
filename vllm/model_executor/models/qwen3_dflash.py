@@ -64,14 +64,11 @@ def _dflash_k_norm_rope_triton_kernel(
     is_neox: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ) -> None:
-    row_idx = tl.program_id(0)
+    head_idx = tl.program_id(0)
+    token_idx = tl.program_id(1)
+    layer_idx = tl.program_id(2)
     pair_offsets = tl.arange(0, BLOCK_SIZE)
     half_head_dim: tl.constexpr = head_dim // 2
-    mask = pair_offsets < half_head_dim
-
-    head_idx = row_idx % num_kv_heads
-    token_idx = (row_idx // num_kv_heads) % num_ctx
-    layer_idx = row_idx // (num_ctx * num_kv_heads)
 
     row_offset = (
         ((layer_idx * num_ctx + token_idx) * num_kv_heads + head_idx) * head_dim
@@ -85,17 +82,13 @@ def _dflash_k_norm_rope_triton_kernel(
         offset1 = offset0 + 1
         cos_sin_offsets = pair_offsets
 
-    k0 = tl.load(all_k + row_offset + offset0, mask=mask, other=0.0).to(tl.float32)
-    k1 = tl.load(all_k + row_offset + offset1, mask=mask, other=0.0).to(tl.float32)
+    k0 = tl.load(all_k + row_offset + offset0).to(tl.float32)
+    k1 = tl.load(all_k + row_offset + offset1).to(tl.float32)
     w0 = tl.load(
         k_norm_weights + layer_idx * head_dim + offset0,
-        mask=mask,
-        other=0.0,
     ).to(tl.float32)
     w1 = tl.load(
         k_norm_weights + layer_idx * head_dim + offset1,
-        mask=mask,
-        other=0.0,
     ).to(tl.float32)
 
     variance = tl.sum(k0 * k0 + k1 * k1, axis=0) / head_dim
@@ -105,25 +98,18 @@ def _dflash_k_norm_rope_triton_kernel(
 
     pos = tl.load(positions + token_idx)
     half_rotary_dim: tl.constexpr = rotary_dim // 2
-    rotary_mask = pair_offsets < half_rotary_dim
 
     cos = tl.load(
         cos_sin_cache + pos * rotary_dim + cos_sin_offsets,
-        mask=rotary_mask,
-        other=1.0,
     ).to(tl.float32)
     sin = tl.load(
         cos_sin_cache + pos * rotary_dim + half_rotary_dim + cos_sin_offsets,
-        mask=rotary_mask,
-        other=0.0,
     ).to(tl.float32)
 
     out0 = k0 * cos - k1 * sin
     out1 = k1 * cos + k0 * sin
-    k0 = tl.where(rotary_mask, out0, k0)
-    k1 = tl.where(rotary_mask, out1, k1)
-    tl.store(all_k_out + row_offset + offset0, k0, mask=mask)
-    tl.store(all_k_out + row_offset + offset1, k1, mask=mask)
+    tl.store(all_k_out + row_offset + offset0, out0)
+    tl.store(all_k_out + row_offset + offset1, out1)
 
 
 def _dflash_k_norm_rope_triton(
@@ -137,7 +123,10 @@ def _dflash_k_norm_rope_triton(
 ) -> None:
     num_layers, num_ctx, num_kv_heads, head_dim = all_k.shape
     rotary_dim = cos_sin_cache.shape[1]
-    grid = (num_layers * num_ctx * num_kv_heads,)
+    if rotary_dim != head_dim:
+        raise ValueError(
+            "Triton DFlash K norm + RoPE path expects rotary_dim == head_dim")
+    grid = (num_kv_heads, num_ctx, num_layers)
     _dflash_k_norm_rope_triton_kernel[grid](
         all_k,
         all_k_out,
@@ -152,6 +141,7 @@ def _dflash_k_norm_rope_triton(
         is_neox,
         BLOCK_SIZE=triton.next_power_of_2(head_dim // 2),
         num_warps=1,
+        num_stages=1,
     )
 
 
