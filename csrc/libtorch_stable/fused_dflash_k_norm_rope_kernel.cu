@@ -76,7 +76,9 @@ __global__ void dflashKNormRopeKernel(
     void const* all_k_void, void* all_k_out_void,
     void const* k_norm_weights_void, void const* cos_sin_cache_void,
     int64_t const* positions, int const num_layers, int const num_ctx,
-    int const num_kv_heads, float const eps, int const rotary_dim) {
+    int const num_kv_heads, int64_t const all_k_stride0,
+    int64_t const all_k_stride1, int64_t const all_k_stride2,
+    float const eps, int const rotary_dim) {
 #if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800) && !defined(USE_ROCM)
   if constexpr ((std::is_same_v<scalar_t_in, c10::BFloat16>) ||
                 std::is_same_v<scalar_t_cache, c10::BFloat16>) {
@@ -125,19 +127,25 @@ __global__ void dflashKNormRopeKernel(
     constexpr int vec_size = elem_size_bytes / 4;
     using vec_T = typename packed_as<uint, vec_size>::type;
 
-    int64_t const row_offset =
+    int64_t const in_row_offset =
+        static_cast<int64_t>(layer_idx) * all_k_stride0 +
+        static_cast<int64_t>(token_idx) * all_k_stride1 +
+        static_cast<int64_t>(head_idx) * all_k_stride2;
+    int64_t const out_row_offset =
         (((static_cast<int64_t>(layer_idx) * num_ctx + token_idx) *
               num_kv_heads +
           head_idx) *
          head_dim);
-    int64_t const thread_offset =
-        row_offset + lane_id * num_elems_per_thread;
+    int64_t const in_thread_offset =
+        in_row_offset + lane_id * num_elems_per_thread;
+    int64_t const out_thread_offset =
+        out_row_offset + lane_id * num_elems_per_thread;
 
     float elements[num_elems_per_thread];
     float sum_squares = 0.0f;
 
     {
-      vec_T vec = *reinterpret_cast<vec_T const*>(&all_k[thread_offset]);
+      vec_T vec = *reinterpret_cast<vec_T const*>(&all_k[in_thread_offset]);
       constexpr int num_packed_elems = elem_size_bytes / sizeof(T2_in);
 #pragma unroll
       for (int i = 0; i < num_packed_elems; i++) {
@@ -230,7 +238,7 @@ __global__ void dflashKNormRopeKernel(
             make_float2(elements[2 * i], elements[2 * i + 1]));
         *(reinterpret_cast<T2_in*>(&vec) + i) = packed_val;
       }
-      *reinterpret_cast<vec_T*>(&all_k_out[thread_offset]) = vec;
+      *reinterpret_cast<vec_T*>(&all_k_out[out_thread_offset]) = vec;
     }
 #if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800) && !defined(USE_ROCM)
   }
@@ -241,7 +249,8 @@ template <typename scalar_t_in, typename scalar_t_cache>
 void launchDFlashKNormRope(
     void const* all_k, void* all_k_out, void const* k_norm_weights,
     void const* cos_sin_cache, int64_t const* positions, int num_layers,
-    int num_ctx, int num_kv_heads, int head_dim, int rotary_dim, float eps,
+    int num_ctx, int num_kv_heads, int head_dim, int64_t all_k_stride0,
+    int64_t all_k_stride1, int64_t all_k_stride2, int rotary_dim, float eps,
     bool interleave, cudaStream_t stream) {
   constexpr int block_size = 256;
   constexpr int warps_per_block = block_size / 32;
@@ -255,12 +264,14 @@ void launchDFlashKNormRope(
       dflashKNormRopeKernel<scalar_t_in, scalar_t_cache, (HEAD_DIM), true> \
           <<<grid, block, 0, stream>>>(                                    \
               all_k, all_k_out, k_norm_weights, cos_sin_cache, positions,  \
-              num_layers, num_ctx, num_kv_heads, eps, rotary_dim);         \
+              num_layers, num_ctx, num_kv_heads, all_k_stride0,             \
+              all_k_stride1, all_k_stride2, eps, rotary_dim);              \
     } else {                                                               \
       dflashKNormRopeKernel<scalar_t_in, scalar_t_cache, (HEAD_DIM),       \
                             false><<<grid, block, 0, stream>>>(           \
           all_k, all_k_out, k_norm_weights, cos_sin_cache, positions,      \
-          num_layers, num_ctx, num_kv_heads, eps, rotary_dim);             \
+          num_layers, num_ctx, num_kv_heads, all_k_stride0, all_k_stride1, \
+          all_k_stride2, eps, rotary_dim);                                 \
     }                                                                      \
   } while (0)
 
@@ -291,7 +302,7 @@ void dflash_k_norm_rope(
     int64_t rope_head_size,
     bool is_neox,
     double eps) {
-  CHECK_INPUT(all_k);
+  CHECK_TH_CUDA(all_k);
   CHECK_INPUT(all_k_out);
   CHECK_INPUT(k_norm_weights);
   CHECK_INPUT(positions);
@@ -324,6 +335,11 @@ void dflash_k_norm_rope(
   STD_TORCH_CHECK(k_norm_weights.size(0) == num_layers &&
                       k_norm_weights.size(1) == head_dim,
                   "k_norm_weights shape must match [num_layers, head_dim]");
+  STD_TORCH_CHECK(all_k.stride(3) == 1 && all_k.stride(2) == head_dim,
+                  "all_k must have contiguous [num_kv_heads, head_dim] "
+                  "inner dimensions");
+  STD_TORCH_CHECK(all_k_out.is_contiguous(),
+                  "all_k_out must be contiguous");
   STD_TORCH_CHECK(positions.size(0) == num_ctx,
                   "positions length must match num_ctx");
   STD_TORCH_CHECK(rotary_dim % 2 == 0, "rotary_dim must be even");
@@ -363,6 +379,7 @@ void dflash_k_norm_rope(
                   positions.const_data_ptr<int64_t>(),
                   static_cast<int>(num_layers), static_cast<int>(num_ctx),
                   static_cast<int>(num_kv_heads), static_cast<int>(head_dim),
+                  all_k.stride(0), all_k.stride(1), all_k.stride(2),
                   static_cast<int>(rotary_dim), static_cast<float>(eps),
                   !is_neox, stream);
             });

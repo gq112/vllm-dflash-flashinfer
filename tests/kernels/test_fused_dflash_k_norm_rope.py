@@ -125,6 +125,31 @@ def test_dflash_k_norm_rope_matches_reference(
         is_neox,
         eps,
     )
+    all_kv_flat = torch.empty(
+        num_ctx,
+        num_layers,
+        2,
+        num_kv_heads,
+        head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    all_kv_flat[:, :, 0].copy_(all_k.permute(1, 0, 2, 3))
+    strided_all_k = all_kv_flat[:, :, 0].permute(1, 0, 2, 3)
+    assert not strided_all_k.is_contiguous()
+    assert strided_all_k.stride(-1) == 1
+    assert strided_all_k.stride(-2) == head_dim
+    actual_strided = torch.empty_like(all_k)
+    ops.dflash_k_norm_rope(
+        strided_all_k,
+        actual_strided,
+        k_norm_weights,
+        positions,
+        cos_sin_cache,
+        head_dim,
+        is_neox,
+        eps,
+    )
     actual_triton = torch.empty_like(all_k)
     _dflash_k_norm_rope_triton(
         all_k,
@@ -141,4 +166,5 @@ def test_dflash_k_norm_rope_matches_reference(
     else:
         atol, rtol = 1e-2, 1e-2
     torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    torch.testing.assert_close(actual_strided, expected, atol=atol, rtol=rtol)
     torch.testing.assert_close(actual_triton, expected, atol=atol, rtol=rtol)

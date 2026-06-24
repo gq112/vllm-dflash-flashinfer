@@ -548,14 +548,11 @@ class DFlashQwen3Model(nn.Module):
         all_kv_flat = F.linear(
             normed_context_states, self._fused_kv_weight, self._fused_kv_bias
         )
-        # Single contiguous copy that separates K/V and transposes to
-        # layer-major layout.  Result: [2, L, num_ctx, nkv, hd] contiguous.
-        # Indexing dim-0 gives contiguous [L, num_ctx, nkv, hd] for K and V.
-        all_kv = (
-            all_kv_flat.view(num_ctx, L, 2, nkv, hd).permute(2, 1, 0, 3, 4).contiguous()
-        )
-        all_k = all_kv[0]  # [L, num_ctx, nkv, hd], contiguous
-        all_v = all_kv[1]  # [L, num_ctx, nkv, hd], contiguous
+        # Keep the GEMM output in its native token-major layout and expose
+        # layer-major K/V views without a full K/V layout copy.
+        all_kv = all_kv_flat.view(num_ctx, L, 2, nkv, hd)
+        all_k = all_kv[:, :, 0].permute(1, 0, 2, 3)
+        all_v = all_kv[:, :, 1].permute(1, 0, 2, 3)
 
         cos_sin_cache = self._rope_cos_sin_cache
         if cos_sin_cache.dtype != all_k.dtype:
@@ -573,6 +570,8 @@ class DFlashQwen3Model(nn.Module):
         can_fuse_k_norm_rope = (
             all_k.is_cuda
             and self._rope_head_size == hd
+            and all_k.stride(-1) == 1
+            and all_k.stride(-2) == hd
             and hd in (64, 128, 256)
             and cos_sin_cache.shape[1] % (hd // 32) == 0
         )
@@ -581,7 +580,7 @@ class DFlashQwen3Model(nn.Module):
             and can_fuse_k_norm_rope
             and hasattr(torch.ops._C, "dflash_k_norm_rope")
         ):
-            all_k_final = torch.empty_like(all_k)
+            all_k_final = all_k.new_empty((L, num_ctx, nkv, hd))
             ops.dflash_k_norm_rope(
                 all_k,
                 all_k_final,
@@ -597,9 +596,10 @@ class DFlashQwen3Model(nn.Module):
             and can_fuse_k_norm_rope
             and cos_sin_cache.shape[1] == hd
         ):
-            all_k_final = torch.empty_like(all_k)
+            all_k_for_triton = all_k.contiguous()
+            all_k_final = torch.empty_like(all_k_for_triton)
             _dflash_k_norm_rope_triton(
-                all_k,
+                all_k_for_triton,
                 all_k_final,
                 self._stacked_k_norm_weights,
                 context_positions,
@@ -614,11 +614,12 @@ class DFlashQwen3Model(nn.Module):
                     "unfused DFlash K norm + RoPE",
                     k_norm_rope_impl,
                 )
-            all_k_final = torch.empty_like(all_k)
+            all_k_for_fallback = all_k.contiguous()
+            all_k_final = torch.empty_like(all_k_for_fallback)
             for i in range(L):
                 ops.rms_norm(
                     all_k_final[i],
-                    all_k[i],
+                    all_k_for_fallback[i],
                     self._k_norm_weights[i],
                     self._rms_norm_eps,
                 )
