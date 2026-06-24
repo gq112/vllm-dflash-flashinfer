@@ -65,8 +65,9 @@ def _dflash_k_norm_rope_triton_kernel(
     BLOCK_SIZE: tl.constexpr,
 ) -> None:
     row_idx = tl.program_id(0)
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < head_dim
+    pair_offsets = tl.arange(0, BLOCK_SIZE)
+    half_head_dim: tl.constexpr = head_dim // 2
+    mask = pair_offsets < half_head_dim
 
     head_idx = row_idx % num_kv_heads
     token_idx = (row_idx // num_kv_heads) % num_ctx
@@ -75,42 +76,36 @@ def _dflash_k_norm_rope_triton_kernel(
     row_offset = (
         ((layer_idx * num_ctx + token_idx) * num_kv_heads + head_idx) * head_dim
     )
-    k = tl.load(all_k + row_offset + offsets, mask=mask, other=0.0).to(tl.float32)
-    weight = tl.load(
-        k_norm_weights + layer_idx * head_dim + offsets,
+    if is_neox:
+        offset0 = pair_offsets
+        offset1 = pair_offsets + half_head_dim
+        cos_sin_offsets = pair_offsets
+    else:
+        offset0 = pair_offsets * 2
+        offset1 = offset0 + 1
+        cos_sin_offsets = pair_offsets
+
+    k0 = tl.load(all_k + row_offset + offset0, mask=mask, other=0.0).to(tl.float32)
+    k1 = tl.load(all_k + row_offset + offset1, mask=mask, other=0.0).to(tl.float32)
+    w0 = tl.load(
+        k_norm_weights + layer_idx * head_dim + offset0,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    w1 = tl.load(
+        k_norm_weights + layer_idx * head_dim + offset1,
         mask=mask,
         other=0.0,
     ).to(tl.float32)
 
-    variance = tl.sum(k * k, axis=0) / head_dim
-    k = k * tl.rsqrt(variance + eps) * weight
+    variance = tl.sum(k0 * k0 + k1 * k1, axis=0) / head_dim
+    rms_rcp = tl.rsqrt(variance + eps)
+    k0 = k0 * rms_rcp * w0
+    k1 = k1 * rms_rcp * w1
 
-    rotary_mask = offsets < rotary_dim
     pos = tl.load(positions + token_idx)
     half_rotary_dim: tl.constexpr = rotary_dim // 2
-
-    if is_neox:
-        pair_offsets = tl.where(offsets < half_rotary_dim,
-                                offsets + half_rotary_dim,
-                                offsets - half_rotary_dim)
-        cos_sin_offsets = offsets % half_rotary_dim
-        rotate_sign = tl.where(offsets < half_rotary_dim, -1.0, 1.0)
-    else:
-        pair_offsets = tl.where(offsets % 2 == 0, offsets + 1, offsets - 1)
-        cos_sin_offsets = offsets // 2
-        rotate_sign = tl.where(offsets % 2 == 0, -1.0, 1.0)
-
-    pair_k = tl.load(
-        all_k + row_offset + pair_offsets,
-        mask=rotary_mask,
-        other=0.0,
-    ).to(tl.float32)
-    pair_weight = tl.load(
-        k_norm_weights + layer_idx * head_dim + pair_offsets,
-        mask=rotary_mask,
-        other=0.0,
-    ).to(tl.float32)
-    pair_k = pair_k * tl.rsqrt(variance + eps) * pair_weight
+    rotary_mask = pair_offsets < half_rotary_dim
 
     cos = tl.load(
         cos_sin_cache + pos * rotary_dim + cos_sin_offsets,
@@ -123,9 +118,12 @@ def _dflash_k_norm_rope_triton_kernel(
         other=0.0,
     ).to(tl.float32)
 
-    rotated = k * cos + rotate_sign * pair_k * sin
-    k = tl.where(rotary_mask, rotated, k)
-    tl.store(all_k_out + row_offset + offsets, k, mask=mask)
+    out0 = k0 * cos - k1 * sin
+    out1 = k1 * cos + k0 * sin
+    k0 = tl.where(rotary_mask, out0, k0)
+    k1 = tl.where(rotary_mask, out1, k1)
+    tl.store(all_k_out + row_offset + offset0, k0, mask=mask)
+    tl.store(all_k_out + row_offset + offset1, k1, mask=mask)
 
 
 def _dflash_k_norm_rope_triton(
@@ -152,7 +150,8 @@ def _dflash_k_norm_rope_triton(
         rotary_dim,
         eps,
         is_neox,
-        BLOCK_SIZE=triton.next_power_of_2(head_dim),
+        BLOCK_SIZE=triton.next_power_of_2(head_dim // 2),
+        num_warps=1,
     )
 
 
@@ -540,7 +539,11 @@ class DFlashQwen3Model(nn.Module):
                 self._rope_is_neox,
                 self._rms_norm_eps,
             )
-        elif k_norm_rope_impl == "triton" and can_fuse_k_norm_rope:
+        elif (
+            k_norm_rope_impl == "triton"
+            and can_fuse_k_norm_rope
+            and cos_sin_cache.shape[1] == hd
+        ):
             all_k_final = torch.empty_like(all_k)
             _dflash_k_norm_rope_triton(
                 all_k,
