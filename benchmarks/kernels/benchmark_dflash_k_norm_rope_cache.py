@@ -34,6 +34,51 @@ def make_cos_sin_cache(
     return torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(dtype=dtype)
 
 
+def run_old_then_cache_path(
+    all_k: torch.Tensor,
+    all_v: torch.Tensor,
+    key_caches: list[torch.Tensor],
+    value_caches: list[torch.Tensor],
+    k_norm_weights: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    eps: float,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+) -> None:
+    num_layers, num_ctx, num_kv_heads, head_dim = all_k.shape
+    kv_size = num_kv_heads * head_dim
+    all_k_final = torch.empty_like(all_k)
+    for layer_idx in range(num_layers):
+        ops.rms_norm(
+            all_k_final[layer_idx],
+            all_k[layer_idx],
+            k_norm_weights[layer_idx],
+            eps,
+        )
+    ops.rotary_embedding(
+        positions.repeat(num_layers),
+        all_k_final.view(num_layers * num_ctx, kv_size),
+        None,
+        head_dim,
+        cos_sin_cache,
+        is_neox,
+    )
+    for layer_idx in range(num_layers):
+        ops.reshape_and_cache_flash(
+            all_k_final[layer_idx],
+            all_v[layer_idx],
+            key_caches[layer_idx],
+            value_caches[layer_idx],
+            slot_mapping,
+            "auto",
+            k_scale,
+            v_scale,
+        )
+
+
 def run_cuda_then_cache_path(
     all_k: torch.Tensor,
     all_v: torch.Tensor,
@@ -150,7 +195,10 @@ def main() -> None:
     k_scale = torch.tensor([1.0], dtype=torch.float32, device=device)
     v_scale = torch.tensor([1.0], dtype=torch.float32, device=device)
 
-    print("num_ctx,cuda_cache_ms,triton_cache_ms,triton_cache_speedup")
+    print(
+        "num_ctx,old_cache_ms,cuda_cache_ms,triton_cache_ms,"
+        "cuda_speedup,triton_speedup,triton_vs_cuda"
+    )
     for num_ctx in args.num_ctx:
         all_k = torch.randn(
             args.num_layers,
@@ -183,6 +231,24 @@ def main() -> None:
         ]
         value_caches = [torch.empty_like(cache) for cache in key_caches]
 
+        old_cache_ms = benchmark(
+            lambda: run_old_then_cache_path(
+                all_k,
+                all_v,
+                key_caches,
+                value_caches,
+                k_norm_weights,
+                positions,
+                slot_mapping,
+                cos_sin_cache,
+                args.neox,
+                eps,
+                k_scale,
+                v_scale,
+            ),
+            args.iters,
+            args.warmup,
+        )
         cuda_cache_ms = benchmark(
             lambda: run_cuda_then_cache_path(
                 all_k,
@@ -218,7 +284,9 @@ def main() -> None:
             args.warmup,
         )
         print(
-            f"{num_ctx},{cuda_cache_ms:.6f},{triton_cache_ms:.6f},"
+            f"{num_ctx},{old_cache_ms:.6f},{cuda_cache_ms:.6f},"
+            f"{triton_cache_ms:.6f},{old_cache_ms / cuda_cache_ms:.3f}x,"
+            f"{old_cache_ms / triton_cache_ms:.3f}x,"
             f"{cuda_cache_ms / triton_cache_ms:.3f}x"
         )
 
