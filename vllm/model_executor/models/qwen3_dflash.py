@@ -50,6 +50,53 @@ logger = init_logger(__name__)
 
 
 @triton.jit
+def _dflash_k_norm_rope_triton_qwen3_4kv_kernel(
+    all_k,
+    all_k_out,
+    k_norm_weights,
+    positions,
+    cos_sin_cache,
+    num_ctx: tl.constexpr,
+    eps: tl.constexpr,
+    is_neox: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+) -> None:
+    token_idx = tl.program_id(0)
+    layer_idx = tl.program_id(1)
+    head_offsets = tl.arange(0, 4)
+    pair_offsets = tl.arange(0, BLOCK_SIZE)
+
+    row_base = ((layer_idx * num_ctx + token_idx) * 4 + head_offsets) * 128
+    if is_neox:
+        offset0 = pair_offsets
+        offset1 = pair_offsets + 64
+        cos_sin_offsets = pair_offsets
+    else:
+        offset0 = pair_offsets * 2
+        offset1 = offset0 + 1
+        cos_sin_offsets = pair_offsets
+
+    k0 = tl.load(all_k + row_base[:, None] + offset0[None, :]).to(tl.float32)
+    k1 = tl.load(all_k + row_base[:, None] + offset1[None, :]).to(tl.float32)
+    w0 = tl.load(k_norm_weights + layer_idx * 128 + offset0).to(tl.float32)
+    w1 = tl.load(k_norm_weights + layer_idx * 128 + offset1).to(tl.float32)
+
+    variance = tl.sum(k0 * k0 + k1 * k1, axis=1) * (1.0 / 128.0)
+    rms_rcp = tl.rsqrt(variance + eps)[:, None]
+    k0 = k0 * rms_rcp * w0[None, :]
+    k1 = k1 * rms_rcp * w1[None, :]
+
+    pos = tl.load(positions + token_idx)
+    cos = tl.load(cos_sin_cache + pos * 128 + cos_sin_offsets).to(tl.float32)
+    sin = tl.load(cos_sin_cache + pos * 128 + 64 + cos_sin_offsets).to(tl.float32)
+
+    out0 = k0 * cos[None, :] - k1 * sin[None, :]
+    out1 = k1 * cos[None, :] + k0 * sin[None, :]
+    tl.store(all_k_out + row_base[:, None] + offset0[None, :], out0)
+    tl.store(all_k_out + row_base[:, None] + offset1[None, :], out1)
+
+
+@triton.jit
 def _dflash_k_norm_rope_triton_kernel(
     all_k,
     all_k_out,
@@ -126,6 +173,22 @@ def _dflash_k_norm_rope_triton(
     if rotary_dim != head_dim:
         raise ValueError(
             "Triton DFlash K norm + RoPE path expects rotary_dim == head_dim")
+    if num_kv_heads == 4 and head_dim == 128:
+        _dflash_k_norm_rope_triton_qwen3_4kv_kernel[(num_ctx, num_layers)](
+            all_k,
+            all_k_out,
+            k_norm_weights,
+            positions,
+            cos_sin_cache,
+            num_ctx,
+            eps,
+            is_neox,
+            BLOCK_SIZE=64,
+            num_warps=4,
+            num_stages=1,
+        )
+        return
+
     grid = (num_kv_heads, num_ctx, num_layers)
     _dflash_k_norm_rope_triton_kernel[grid](
         all_k,
