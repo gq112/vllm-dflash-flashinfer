@@ -56,28 +56,23 @@ def _dflash_k_norm_rope_triton_kernel(
     k_norm_weights,
     positions,
     cos_sin_cache,
-    num_rows: tl.constexpr,
     num_ctx: tl.constexpr,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
     rotary_dim: tl.constexpr,
     eps: tl.constexpr,
     is_neox: tl.constexpr,
-    BLOCK_ROWS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ) -> None:
-    row_offsets = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    head_idx = tl.program_id(0)
+    token_idx = tl.program_id(1)
+    layer_idx = tl.program_id(2)
     pair_offsets = tl.arange(0, BLOCK_SIZE)
-    row_mask = row_offsets < num_rows
-    pair_mask = pair_offsets < head_dim // 2
-    mask = row_mask[:, None] & pair_mask[None, :]
-
     half_head_dim: tl.constexpr = head_dim // 2
-    head_idx = row_offsets % num_kv_heads
-    token_idx = (row_offsets // num_kv_heads) % num_ctx
-    layer_idx = row_offsets // (num_ctx * num_kv_heads)
 
-    row_base = row_offsets * head_dim
+    row_offset = (
+        ((layer_idx * num_ctx + token_idx) * num_kv_heads + head_idx) * head_dim
+    )
     if is_neox:
         offset0 = pair_offsets
         offset1 = pair_offsets + half_head_dim
@@ -87,47 +82,34 @@ def _dflash_k_norm_rope_triton_kernel(
         offset1 = offset0 + 1
         cos_sin_offsets = pair_offsets
 
-    k0 = tl.load(all_k + row_base[:, None] + offset0[None, :],
-                 mask=mask,
-                 other=0.0).to(tl.float32)
-    k1 = tl.load(all_k + row_base[:, None] + offset1[None, :],
-                 mask=mask,
-                 other=0.0).to(tl.float32)
+    k0 = tl.load(all_k + row_offset + offset0).to(tl.float32)
+    k1 = tl.load(all_k + row_offset + offset1).to(tl.float32)
     w0 = tl.load(
-        k_norm_weights + layer_idx[:, None] * head_dim + offset0[None, :],
-        mask=mask,
-        other=0.0,
+        k_norm_weights + layer_idx * head_dim + offset0,
     ).to(tl.float32)
     w1 = tl.load(
-        k_norm_weights + layer_idx[:, None] * head_dim + offset1[None, :],
-        mask=mask,
-        other=0.0,
+        k_norm_weights + layer_idx * head_dim + offset1,
     ).to(tl.float32)
 
-    variance = tl.sum(k0 * k0 + k1 * k1, axis=1) / head_dim
-    rms_rcp = tl.rsqrt(variance + eps)[:, None]
+    variance = tl.sum(k0 * k0 + k1 * k1, axis=0) / head_dim
+    rms_rcp = tl.rsqrt(variance + eps)
     k0 = k0 * rms_rcp * w0
     k1 = k1 * rms_rcp * w1
 
+    pos = tl.load(positions + token_idx)
     half_rotary_dim: tl.constexpr = rotary_dim // 2
-    pos = tl.load(positions + token_idx, mask=row_mask, other=0)
 
     cos = tl.load(
-        cos_sin_cache + pos[:, None] * rotary_dim + cos_sin_offsets[None, :],
-        mask=mask,
-        other=1.0,
+        cos_sin_cache + pos * rotary_dim + cos_sin_offsets,
     ).to(tl.float32)
     sin = tl.load(
-        cos_sin_cache + pos[:, None] * rotary_dim + half_rotary_dim
-        + cos_sin_offsets[None, :],
-        mask=mask,
-        other=0.0,
+        cos_sin_cache + pos * rotary_dim + half_rotary_dim + cos_sin_offsets,
     ).to(tl.float32)
 
     out0 = k0 * cos - k1 * sin
     out1 = k1 * cos + k0 * sin
-    tl.store(all_k_out + row_base[:, None] + offset0[None, :], out0, mask=mask)
-    tl.store(all_k_out + row_base[:, None] + offset1[None, :], out1, mask=mask)
+    tl.store(all_k_out + row_offset + offset0, out0)
+    tl.store(all_k_out + row_offset + offset1, out1)
 
 
 def _dflash_k_norm_rope_triton(
@@ -144,23 +126,19 @@ def _dflash_k_norm_rope_triton(
     if rotary_dim != head_dim:
         raise ValueError(
             "Triton DFlash K norm + RoPE path expects rotary_dim == head_dim")
-    num_rows = num_layers * num_ctx * num_kv_heads
-    block_rows = 4
-    grid = (triton.cdiv(num_rows, block_rows),)
+    grid = (num_kv_heads, num_ctx, num_layers)
     _dflash_k_norm_rope_triton_kernel[grid](
         all_k,
         all_k_out,
         k_norm_weights,
         positions,
         cos_sin_cache,
-        num_rows,
         num_ctx,
         num_kv_heads,
         head_dim,
         rotary_dim,
         eps,
         is_neox,
-        BLOCK_ROWS=block_rows,
         BLOCK_SIZE=triton.next_power_of_2(head_dim // 2),
         num_warps=1,
         num_stages=1,
