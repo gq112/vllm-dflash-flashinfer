@@ -39,36 +39,42 @@ def _dflash_k_norm_rope_multi_cache_update_kernel(
     ROTARY_DIM: tl.constexpr,
     IS_NEOX: tl.constexpr,
     ROUND_TO_BF16: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    heads_per_layer = num_ctx * NUM_KV_HEADS
-    layer_idx = row // heads_per_layer
-    rem = row - layer_idx * heads_per_layer
-    token_idx = rem // NUM_KV_HEADS
-    head_idx = rem - token_idx * NUM_KV_HEADS
+    layer_idx = tl.program_id(0)
+    row_offsets = tl.program_id(1) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    rows_per_layer = num_ctx * NUM_KV_HEADS
+    row_mask = row_offsets < rows_per_layer
+    token_idx = row_offsets // NUM_KV_HEADS
+    head_idx = row_offsets - token_idx * NUM_KV_HEADS
 
-    slot_idx = tl.load(slot_mapping_ptr + token_idx)
+    slot_idx = tl.load(slot_mapping_ptr + token_idx, mask=row_mask, other=-1)
     block_idx = slot_idx // block_size
     block_offset = slot_idx - block_idx * block_size
 
     offs = tl.arange(0, BLOCK_D)
-    mask = offs < HEAD_DIM
+    dim_mask = offs < HEAD_DIM
+    mask = row_mask[:, None] & dim_mask[None, :]
 
     k_base = (
         all_k_ptr
         + layer_idx * all_k_stride_l
-        + token_idx * all_k_stride_t
-        + head_idx * all_k_stride_h
+        + token_idx[:, None] * all_k_stride_t
+        + head_idx[:, None] * all_k_stride_h
     )
     weight_base = k_norm_weights_ptr + layer_idx * HEAD_DIM
 
-    k = tl.load(k_base + offs, mask=mask, other=0.0).to(tl.float32)
-    sum_squares = tl.sum(k * k, axis=0)
+    k = tl.load(k_base + offs[None, :], mask=mask, other=0.0).to(tl.float32)
+    sum_squares = tl.sum(k * k, axis=1)
     rms_rcp = tl.rsqrt(sum_squares / HEAD_DIM + eps)
 
-    weight = tl.load(weight_base + offs, mask=mask, other=0.0).to(tl.float32)
-    k_norm = k * rms_rcp * weight
+    weight = tl.load(
+        weight_base + offs,
+        mask=dim_mask,
+        other=0.0,
+    ).to(tl.float32)
+    k_norm = k * rms_rcp[:, None] * weight[None, :]
     if ROUND_TO_BF16:
         k_norm = k_norm.to(tl.bfloat16).to(tl.float32)
     else:
@@ -88,39 +94,48 @@ def _dflash_k_norm_rope_multi_cache_update_kernel(
         cos_idx = offs // 2
 
     safe_pair_offs = tl.where(rope_mask, pair_offs, offs)
-    pair_k = tl.load(k_base + safe_pair_offs, mask=mask, other=0.0).to(tl.float32)
-    pair_weight = tl.load(
-        weight_base + safe_pair_offs,
+    pair_k = tl.load(
+        k_base + safe_pair_offs[None, :],
         mask=mask,
         other=0.0,
     ).to(tl.float32)
-    pair_norm = pair_k * rms_rcp * pair_weight
+    pair_weight = tl.load(
+        weight_base + safe_pair_offs,
+        mask=dim_mask,
+        other=0.0,
+    ).to(tl.float32)
+    pair_norm = pair_k * rms_rcp[:, None] * pair_weight[None, :]
     if ROUND_TO_BF16:
         pair_norm = pair_norm.to(tl.bfloat16).to(tl.float32)
     else:
         pair_norm = pair_norm.to(tl.float16).to(tl.float32)
 
-    pos = tl.load(positions_ptr + token_idx)
-    rope_base = cos_sin_cache_ptr + pos * ROTARY_DIM
-    cos = tl.load(rope_base + cos_idx, mask=rope_mask, other=1.0).to(tl.float32)
+    pos = tl.load(positions_ptr + token_idx, mask=row_mask, other=0)
+    rope_base = cos_sin_cache_ptr + pos[:, None] * ROTARY_DIM
+    rope_load_mask = row_mask[:, None] & rope_mask[None, :]
+    cos = tl.load(
+        rope_base + cos_idx[None, :],
+        mask=rope_load_mask,
+        other=1.0,
+    ).to(tl.float32)
     sin = tl.load(
-        rope_base + half_rotary_dim + cos_idx,
-        mask=rope_mask,
+        rope_base + half_rotary_dim + cos_idx[None, :],
+        mask=rope_load_mask,
         other=0.0,
     ).to(tl.float32)
     k_rope = k_norm * cos + sign * pair_norm * sin
-    k_out = tl.where(rope_mask, k_rope, k_norm)
+    k_out = tl.where(rope_mask[None, :], k_rope, k_norm)
 
     key_base = (
         key_cache_ptr
         + layer_idx * key_cache_stride_l
-        + block_idx * key_cache_stride_b
-        + block_offset * key_cache_stride_o
-        + head_idx * key_cache_stride_h
+        + block_idx[:, None] * key_cache_stride_b
+        + block_offset[:, None] * key_cache_stride_o
+        + head_idx[:, None] * key_cache_stride_h
     )
-    store_mask = mask & (slot_idx >= 0)
+    store_mask = mask & (slot_idx[:, None] >= 0)
     tl.store(
-        key_base + offs,
+        key_base + offs[None, :],
         k_out.to(key_cache_ptr.dtype.element_ty),
         mask=store_mask,
     )
@@ -128,19 +143,19 @@ def _dflash_k_norm_rope_multi_cache_update_kernel(
     v_base = (
         all_v_ptr
         + layer_idx * all_v_stride_l
-        + token_idx * all_v_stride_t
-        + head_idx * all_v_stride_h
+        + token_idx[:, None] * all_v_stride_t
+        + head_idx[:, None] * all_v_stride_h
     )
     value_base = (
         value_cache_ptr
         + layer_idx * value_cache_stride_l
-        + block_idx * value_cache_stride_b
-        + block_offset * value_cache_stride_o
-        + head_idx * value_cache_stride_h
+        + block_idx[:, None] * value_cache_stride_b
+        + block_offset[:, None] * value_cache_stride_o
+        + head_idx[:, None] * value_cache_stride_h
     )
-    v = tl.load(v_base + offs, mask=mask, other=0.0)
+    v = tl.load(v_base + offs[None, :], mask=mask, other=0.0)
     tl.store(
-        value_base + offs,
+        value_base + offs[None, :],
         v.to(value_cache_ptr.dtype.element_ty),
         mask=store_mask,
     )
@@ -158,6 +173,7 @@ def dflash_k_norm_rope_multi_cache_update(
     rope_head_size: int,
     is_neox: bool,
     eps: float,
+    block_rows: int | None = None,
 ) -> None:
     num_layers, num_ctx, num_kv_heads, head_dim = all_k.shape
     rotary_dim = cos_sin_cache.shape[1]
@@ -186,8 +202,20 @@ def dflash_k_norm_rope_multi_cache_update(
         )
 
     block_size = key_cache.shape[2]
+    if block_rows is None:
+        block_rows = 2 if head_dim >= 256 else 4
+    if block_rows < 1:
+        raise ValueError("DFlash Triton cache update requires block_rows >= 1")
+
     block_d = triton.next_power_of_2(head_dim)
-    grid = (num_layers * num_ctx * num_kv_heads,)
+    rows_per_layer = num_ctx * num_kv_heads
+    grid = (num_layers, triton.cdiv(rows_per_layer, block_rows))
+    elems_per_program = block_rows * block_d
+    num_warps = 1
+    if elems_per_program > 256:
+        num_warps = 4
+    elif elems_per_program > 128:
+        num_warps = 2
 
     _dflash_k_norm_rope_multi_cache_update_kernel[grid](
         all_k,
@@ -220,6 +248,7 @@ def dflash_k_norm_rope_multi_cache_update(
         ROTARY_DIM=rotary_dim,
         IS_NEOX=is_neox,
         ROUND_TO_BF16=all_k.dtype == torch.bfloat16,
+        BLOCK_ROWS=block_rows,
         BLOCK_D=block_d,
-        num_warps=1,
+        num_warps=num_warps,
     )

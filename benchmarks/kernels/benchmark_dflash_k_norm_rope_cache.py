@@ -177,6 +177,7 @@ def run_triton_cache_path(
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
     eps: float,
+    block_rows: int | None,
 ) -> None:
     from vllm.model_executor.kernels.dflash_triton import (
         dflash_k_norm_rope_multi_cache_update,
@@ -194,6 +195,7 @@ def run_triton_cache_path(
         all_k.shape[-1],
         is_neox,
         eps,
+        block_rows,
     )
 
 
@@ -246,6 +248,15 @@ def main() -> None:
         "--include-triton",
         action="store_true",
         help="Also benchmark the optional Triton multi-cache implementation.",
+    )
+    parser.add_argument(
+        "--triton-block-rows",
+        type=int,
+        default=None,
+        help=(
+            "Rows handled by one Triton program. Defaults to 4 for head_dim "
+            "< 256 and 2 for head_dim >= 256."
+        ),
     )
     args = parser.parse_args()
 
@@ -375,6 +386,7 @@ def main() -> None:
                     cos_sin_cache,
                     args.neox,
                     eps,
+                    args.triton_block_rows,
                 ),
                 args.iters,
                 args.warmup,
