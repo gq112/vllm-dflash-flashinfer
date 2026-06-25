@@ -151,7 +151,8 @@ def test_dflash_k_norm_rope_matches_reference(
     )
     all_kv_flat[:, :, 0].copy_(all_k.permute(1, 0, 2, 3))
     strided_all_k = all_kv_flat[:, :, 0].permute(1, 0, 2, 3)
-    assert not strided_all_k.is_contiguous()
+    if num_layers * num_ctx > 1:
+        assert not strided_all_k.is_contiguous()
     assert strided_all_k.stride(-1) == 1
     assert strided_all_k.stride(-2) == head_dim
     actual_strided = torch.empty_like(all_k)
