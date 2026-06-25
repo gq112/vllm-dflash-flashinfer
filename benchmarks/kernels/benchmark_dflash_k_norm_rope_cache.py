@@ -7,6 +7,7 @@ Example:
 """
 
 import argparse
+import math
 
 import torch
 
@@ -140,6 +141,62 @@ def run_cuda_cache_path(
         )
 
 
+def run_cuda_multi_cache_path(
+    all_k: torch.Tensor,
+    all_v: torch.Tensor,
+    stacked_kv_cache: torch.Tensor,
+    k_norm_weights: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    eps: float,
+) -> None:
+    ops.dflash_k_norm_rope_multi_cache_update(
+        all_k,
+        all_v,
+        stacked_kv_cache[:, :, 0],
+        stacked_kv_cache[:, :, 1],
+        k_norm_weights,
+        positions,
+        cos_sin_cache,
+        slot_mapping,
+        all_k.shape[-1],
+        is_neox,
+        eps,
+    )
+
+
+def run_triton_cache_path(
+    all_k: torch.Tensor,
+    all_v: torch.Tensor,
+    stacked_kv_cache: torch.Tensor,
+    k_norm_weights: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    eps: float,
+) -> None:
+    from vllm.model_executor.kernels.dflash_triton import (
+        dflash_k_norm_rope_multi_cache_update,
+    )
+
+    dflash_k_norm_rope_multi_cache_update(
+        all_k,
+        all_v,
+        stacked_kv_cache[:, :, 0],
+        stacked_kv_cache[:, :, 1],
+        k_norm_weights,
+        positions,
+        cos_sin_cache,
+        slot_mapping,
+        all_k.shape[-1],
+        is_neox,
+        eps,
+    )
+
+
 def benchmark(fn, iters: int, warmup: int) -> float:
     for _ in range(warmup):
         fn()
@@ -155,6 +212,24 @@ def benchmark(fn, iters: int, warmup: int) -> float:
     return start.elapsed_time(end) / iters
 
 
+def fmt_ms(ms: float) -> str:
+    if math.isnan(ms):
+        return "NA"
+    return f"{ms:.6f}"
+
+
+def fmt_speedup(base_ms: float, ms: float) -> str:
+    if math.isnan(ms):
+        return "NA"
+    return f"{base_ms / ms:.3f}x"
+
+
+def fmt_ratio(numerator_ms: float, denominator_ms: float) -> str:
+    if math.isnan(numerator_ms) or math.isnan(denominator_ms):
+        return "NA"
+    return f"{numerator_ms / denominator_ms:.3f}x"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-layers", type=int, default=3)
@@ -167,12 +242,20 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--max-pos", type=int, default=4096)
     parser.add_argument("--neox", action="store_true")
+    parser.add_argument(
+        "--include-triton",
+        action="store_true",
+        help="Also benchmark the optional Triton multi-cache implementation.",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     if not hasattr(torch.ops._C, "dflash_k_norm_rope_cache_update"):
         raise RuntimeError("dflash_k_norm_rope_cache_update op is not available")
+    has_multi_cache = hasattr(torch.ops._C, "dflash_k_norm_rope_multi_cache_update")
+    if not has_multi_cache:
+        print("warning: dflash_k_norm_rope_multi_cache_update op is not available")
 
     device = "cuda"
     dtype = getattr(torch, args.dtype)
@@ -190,8 +273,11 @@ def main() -> None:
     v_scale = torch.tensor([1.0], dtype=torch.float32, device=device)
 
     print(
-        "num_ctx,old_ms,cuda_ms,cuda_cache_ms,"
-        "cuda_speedup,cuda_cache_speedup,cuda_cache_vs_cuda"
+        "num_ctx,old_ms,cuda_ms,cuda_cache_ms,cuda_multi_cache_ms,"
+        "triton_cache_ms,cuda_speedup,cuda_cache_speedup,"
+        "cuda_multi_cache_speedup,triton_cache_speedup,"
+        "cuda_cache_vs_cuda,cuda_multi_cache_vs_cuda_cache,"
+        "triton_cache_vs_cuda_multi_cache"
     )
     for num_ctx in args.num_ctx:
         all_kv_flat = torch.randn(
@@ -214,17 +300,18 @@ def main() -> None:
         )
         num_blocks = (num_ctx + args.block_size - 1) // args.block_size
         slot_mapping = torch.arange(num_ctx, dtype=torch.int64, device=device)
+        stacked_kv_cache = torch.empty(
+            args.num_layers,
+            num_blocks,
+            2,
+            args.block_size,
+            args.num_kv_heads,
+            args.head_dim,
+            dtype=dtype,
+            device=device,
+        )
         kv_caches = [
-            torch.empty(
-                num_blocks,
-                2,
-                args.block_size,
-                args.num_kv_heads,
-                args.head_dim,
-                dtype=dtype,
-                device=device,
-            )
-            for _ in range(args.num_layers)
+            stacked_kv_cache[layer_idx] for layer_idx in range(args.num_layers)
         ]
 
         old_ms = benchmark(
@@ -276,10 +363,54 @@ def main() -> None:
             args.iters,
             args.warmup,
         )
+        if has_multi_cache:
+            cuda_multi_cache_ms = benchmark(
+                lambda: run_cuda_multi_cache_path(
+                    all_k,
+                    all_v,
+                    stacked_kv_cache,
+                    k_norm_weights,
+                    positions,
+                    slot_mapping,
+                    cos_sin_cache,
+                    args.neox,
+                    eps,
+                ),
+                args.iters,
+                args.warmup,
+            )
+        else:
+            cuda_multi_cache_ms = math.nan
+
+        if args.include_triton:
+            triton_cache_ms = benchmark(
+                lambda: run_triton_cache_path(
+                    all_k,
+                    all_v,
+                    stacked_kv_cache,
+                    k_norm_weights,
+                    positions,
+                    slot_mapping,
+                    cos_sin_cache,
+                    args.neox,
+                    eps,
+                ),
+                args.iters,
+                args.warmup,
+            )
+        else:
+            triton_cache_ms = math.nan
+
         print(
-            f"{num_ctx},{old_ms:.6f},{cuda_ms:.6f},{cuda_cache_ms:.6f},"
-            f"{old_ms / cuda_ms:.3f}x,{old_ms / cuda_cache_ms:.3f}x,"
-            f"{cuda_ms / cuda_cache_ms:.3f}x"
+            f"{num_ctx},{fmt_ms(old_ms)},{fmt_ms(cuda_ms)},"
+            f"{fmt_ms(cuda_cache_ms)},{fmt_ms(cuda_multi_cache_ms)},"
+            f"{fmt_ms(triton_cache_ms)},{fmt_speedup(old_ms, cuda_ms)},"
+            f"{fmt_speedup(old_ms, cuda_cache_ms)},"
+            f"{fmt_speedup(old_ms, cuda_multi_cache_ms)},"
+            f"{fmt_speedup(old_ms, triton_cache_ms)},"
+            f"{fmt_ratio(cuda_ms, cuda_cache_ms)},"
+            f"{fmt_ratio(cuda_cache_ms, cuda_multi_cache_ms)},"
+            f"{fmt_ratio(cuda_multi_cache_ms, triton_cache_ms)}"
         )
 
 
